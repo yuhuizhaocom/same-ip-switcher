@@ -17,10 +17,11 @@ if (Test-Path $cfgFile) {
 }
 else {
     Write-Host "WARN: network-config.ps1 not found next to the script - using defaults." -ForegroundColor Yellow
-    $IpActive  = "10.2.5.199"
-    $Mask      = "255.255.248.0"
-    $Gw        = "10.2.3.254"
-    $WifiSsids = @("ENUO-12")
+    $IpActive    = "10.2.5.199"
+    $Mask        = "255.255.248.0"
+    $Gw          = "10.2.3.254"
+    $DnsPrimary  = "223.5.5.5"
+    $WifiSsids   = @("ENUO-12")
 }
 
 # run log: append a timestamped copy of every message (same text as console) here.
@@ -87,14 +88,32 @@ function Wait-ForUp($a, [int]$seconds = 25) {
     }
     return $false
 }
-# wait until the adapter holds a real (non-APIPA / non-empty) IPv4 address
-function Wait-Stable-IPv4($a, [int]$seconds = 20) {
+# Probe whether the Ethernet cable is physically connected even when the adapter
+# was left DISABLED by a previous quarantine (a disabled adapter reports no link).
+# Temporarily enables it, watches for "Up", then restores the disabled state if
+# no link appears. Returns $true only when a cable is actually present.
+function Probe-Cable($eth, [int]$seconds = 5) {
+    if ($null -eq $eth) { return $false }
+    $r = Ref $eth
+    if (-not $r) { return $false }
+    if ($r.Status -eq "Up") { return $true }   # already linked
+    $wasDisabled = ($r.Status -eq "Disabled")
+    if ($wasDisabled) {
+        Step "probe cable: temporarily enabling Ethernet"
+        Enable-NetAdapter -Name $eth.Name -Confirm:$false -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
+    $found = $false
     for ($i = 0; $i -lt $seconds * 2; $i++) {
-        $ip = Get-Adp-IP $a
-        if ($ip -and -not $ip.StartsWith("169.254.")) { return $true }
+        $r2 = Ref $eth
+        if ($r2 -and $r2.Status -eq "Up") { $found = $true; break }
         Start-Sleep -Milliseconds 500
     }
-    return $false
+    if ($wasDisabled -and -not $found) {
+        Step "probe cable: no cable -> restoring Ethernet disabled state"
+        Disable-NetAdapter -Name $eth.Name -Confirm:$false -ErrorAction SilentlyContinue
+    }
+    return $found
 }
 function Set-Adp-IP($a, [string]$ip, [int]$retries = 2) {
     if ($null -eq $a) { Msg "  no adapter" Red "error"; return $false }
@@ -112,6 +131,33 @@ function Set-Adp-IP($a, [string]$ip, [int]$retries = 2) {
         Start-Sleep -Milliseconds 1200
     }
     return $false
+}
+# set IPv4 DNS on the adapter. The applied list is EXACTLY 2 servers:
+#   [ gateway, configured backup DNS ].
+# Windows' resolver only reliably honors 2 DNS slots per adapter (GUI limit;
+# netsh add dnsservers beyond #2 can silently reject), so the gateway must
+# occupy a guaranteed slot. The GATEWAY comes FIRST because on the
+# meeting-room WiFi the public DNS is blocked and the gateway resolver answers
+# instantly; putting it second would make every query wait for the public DNS
+# timeout. On the office Ethernet the gateway also resolves public names, so
+# this one config works fast on both networks.
+function Set-Adp-Dns($a) {
+    if ($null -eq $a) { return }
+    if (-not $DnsPrimary) { Msg "  WARN: no DNS configured - skip" Yellow "warn"; return }
+    $idx = $a.ifIndex
+    $dnsList = @($Gw, $DnsPrimary)
+    # Set-DnsClientServerAddress writes the list in one call with NO server-side
+    # validation (netsh add dnsservers validates by default and can silently
+    # reject a working-but-slow resolver like the gateway).
+    Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses $dnsList -ErrorAction SilentlyContinue
+    # report what actually landed on the adapter, not what we intended
+    $applied = @(Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty ServerAddresses)
+    if ($applied) {
+        Msg ("  set DNS on " + $a.InterfaceDescription + " = " + ($applied -join ", ")) ([ConsoleColor]::DarkGray) "step"
+    }
+    else {
+        Msg ("  WARN: DNS set failed on " + $a.InterfaceDescription) ([ConsoleColor]::Yellow) "warn"
+    }
 }
 function Del-Adp-IP($a, [string]$ip) {
     if ($null -eq $a) { return }
@@ -140,8 +186,10 @@ function Connect-Wifi($a) {
     }
     if (-not $linked) { Msg "  auto-connect failed -> connect WiFi in tray." ([ConsoleColor]::Yellow) "warn" }
     Wait-ForUp $a 20 | Out-Null
-    $stable = Wait-Stable-IPv4 $a 20
-    Msg ("  WiFi IPv4 now: " + (Get-Adp-IP $a) + " (stable=" + $stable + ")") ([ConsoleColor]::DarkGray) "step"
+    # NOTE: no DHCP-stable wait here - this network never hands out a lease
+    # (always APIPA), and the static IP is forced right after by Set-Adp-IP,
+    # which verifies its own success. Waiting for a "stable" lease wasted a
+    # full 20s on every WiFi switch for zero value.
 }
 # keep the outgoing adapter disabled and clear the active IP belonging to it,
 # so a later switch never hits the "IP already held by another adapter" conflict.
@@ -154,6 +202,22 @@ function Get-Adp-IP($a) {
     if (-not (IsAdapter $a)) { return "" }
     $x = Get-NetIPAddress -InterfaceAlias $a.Name -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($x) { return $x.IPAddress } else { return "" }
+}
+# Post-switch connectivity check — SINGLE fast probe.
+# DNS is provided by the gateway itself (Set-Adp-Dns puts $Gw first), so one
+# gateway probe proves BOTH the route and a working resolver exist; the old
+# public-egress TCP probe and DNS resolution chain added 15-30s per run with
+# no extra decision value, so they were removed.
+function Check-Connectivity($a) {
+    if (-not (IsAdapter $a) -or -not (Adp-Up $a)) { return }
+    Step ("connectivity check on " + $a.InterfaceDescription)
+    $null = & ping.exe -n 1 -w 1500 $Gw 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Msg ("  gateway " + $Gw + " reachable (DNS is served by the gateway - OK)") ([ConsoleColor]::Green) "step"
+    }
+    else {
+        Msg ("  gateway " + $Gw + " NOT reachable -> check that " + $IpActive + " is free (another device may hold it) and netmask/gateway match this network") ([ConsoleColor]::Yellow) "warn"
+    }
 }
 
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -187,10 +251,16 @@ try {
         default {
             # Cable decides first: once the wired adapter link is up, we switch
             # to Ethernet (and fix it to the active IP), even if WiFi still
-            # holds it. Only when there is NO cable do we keep/join WiFi.
+            # holds it. The Ethernet adapter is usually left DISABLED by a
+            # previous quarantine, so when it is not up we first PROBE it (brief
+            # enable -> watch for link -> restore) instead of assuming no cable.
             if (Adp-Up $Eth) {
                 $toWifi = $false
                 Msg "Cable link found -> Ethernet." ([ConsoleColor]::Green) "info"
+            }
+            elseif (Probe-Cable $Eth) {
+                $toWifi = $false
+                Msg "Cable detected (Ethernet was disabled) -> Ethernet." ([ConsoleColor]::Green) "info"
             }
             elseif ($wifiOn -and $wifiIP -eq $IpActive) {
                 $toWifi = $true
@@ -222,11 +292,14 @@ try {
             Msg "-> Switching to WiFi" ([ConsoleColor]::Yellow) "info"
             Connect-Wifi $Wifi
             Step ("disable Ethernet first (release " + $IpActive + ")")
-            Disable-NetAdapter -Name $Eth.Name -Confirm:$false -ErrorAction SilentlyContinue
-            Release-IP $Eth
+            if (IsAdapter $Eth) {
+                Disable-NetAdapter -Name $Eth.Name -Confirm:$false -ErrorAction SilentlyContinue
+                Release-IP $Eth
+            }
             Start-Sleep -Seconds 2
             Step ("set WiFi = " + $IpActive)
             $null = Set-Adp-IP $Wifi $IpActive
+            Set-Adp-Dns $Wifi
             Clean-Active $Wifi $IpActive
             Step "quarantine Ethernet (clear IP, keep disabled)"
             Quarantine $Eth
@@ -234,12 +307,15 @@ try {
         else {
             Msg "-> Switching to Ethernet" ([ConsoleColor]::Yellow) "info"
             Step ("disable WiFi first (release " + $IpActive + ")")
-            Disable-NetAdapter -Name $Wifi.Name -Confirm:$false -ErrorAction SilentlyContinue
-            Release-IP $Wifi
+            if (IsAdapter $Wifi) {
+                Disable-NetAdapter -Name $Wifi.Name -Confirm:$false -ErrorAction SilentlyContinue
+                Release-IP $Wifi
+            }
             Start-Sleep -Seconds 2
             Step ("enable Ethernet (need cable) and set = " + $IpActive)
             Ensure-Up $Eth
             $null = Set-Adp-IP $Eth $IpActive
+            Set-Adp-Dns $Eth
             Clean-Active $Eth $IpActive
             Step "quarantine WiFi (clear IP, keep disabled)"
             Quarantine $Wifi
@@ -251,6 +327,9 @@ catch {
 }
 
 if (-not $alreadyOk) { Start-Sleep -Seconds 2 }
+# run a health check on the adapter that should now be active, so a
+# "switched but no internet" state is visible and guided instead of silent.
+if ($toWifi) { Check-Connectivity $Wifi } else { Check-Connectivity $Eth }
 $rEthIP  = Get-Adp-IP $Eth
 $rEthOn  = Adp-Up $Eth
 $rWifiIP = Get-Adp-IP $Wifi
